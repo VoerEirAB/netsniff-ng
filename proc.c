@@ -25,7 +25,7 @@ void cpu_affinity(int cpu)
 	ret = sched_setaffinity(getpid(), sizeof(cpu_bitmask),
 				&cpu_bitmask);
 	if (ret)
-		panic("Can't set this cpu affinity!\n");
+		printf("[WARNING] Can't set this cpu affinity :: CPU %i!\n", cpu);
 }
 
 int set_proc_prio(int priority)
