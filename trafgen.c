@@ -83,6 +83,20 @@ struct ctx {
 	struct dev_io *dev_in;
 	unsigned long num;
 	unsigned int cpus;
+	/*
+	bind_cpus is an array of cpu ids passed to trafgen as parameter --bind-cpus or -x.
+	When the parameter is not passed, bind_cpus is set to an array of all cpu ids
+	available to the machine.
+	*/
+	unsigned int *bind_cpus;
+	/*
+	cpu_min is the minimum cpu id among all the cpus available to trafgen.
+	When --bind-cpus or -x parameter is passed, cpu_min is the minimum cpu id among the
+	passed comma separated cpu ids.
+	When --bind-cpus or -x parameter is not passed, cpu_min is set to 0.
+	cpu_min is used to log scheduled packets information only once in the main_loop function.
+	*/
+	unsigned int cpu_min;
 	uid_t uid; gid_t gid;
 	char *device, *rhost;
 	struct sockaddr_in dest;
@@ -107,7 +121,7 @@ size_t plen = 0;
 struct packet_dyn *packet_dyn = NULL;
 size_t dlen = 0;
 
-static const char *short_options = "d:c:n:t:vJhS:rk:i:o:VRs:P:eE:pu:g:CHQqD:b:";
+static const char *short_options = "d:c:n:t:vJhS:rk:i:o:VRs:P:x:eE:pu:g:CHQqD:b:";
 static const struct option long_options[] = {
 	{"dev",			required_argument,	NULL, 'd'},
 	{"out",			required_argument,	NULL, 'o'},
@@ -117,6 +131,7 @@ static const struct option long_options[] = {
 	{"gap",			required_argument,	NULL, 't'},
 	{"rate",		required_argument,	NULL, 'b'},
 	{"cpus",		required_argument,	NULL, 'P'},
+	{"bind-cpus",		required_argument,	NULL, 'x'},
 	{"ring-size",		required_argument,	NULL, 'S'},
 	{"kernel-pull",		required_argument,	NULL, 'k'},
 	{"smoke-test",		required_argument,	NULL, 's'},
@@ -196,6 +211,7 @@ static void __noreturn help(void)
 	     "  -n|--num <uint>                       Number of packets until exit (def: 0)\n"
 	     "  -r|--rand                             Randomize packet selection (def: round robin)\n"
 	     "  -P|--cpus <uint>                      Specify number of forks(<= CPUs) (def: #CPUs)\n"
+	     "  -x|--bind-cpus <uint>                 Bind to specific comma separated CPUs\n"
 	     "  -t|--gap <time>                       Set approx. interpacket gap (s/ms/us/ns, def: us)\n"
 	     "  -b|--rate <rate>                      Send traffic at specified rate (pps/B/kB/MB/GB/kbit/Mbit/Gbit/KiB/MiB/GiB)\n"
 	     "  -S|--ring-size <size>                 Manually set mmap size (KiB/MiB/GiB)\n"
@@ -214,6 +230,7 @@ static void __noreturn help(void)
 	     "Examples:\n"
 	     "  trafgen --dev eth0 --conf trafgen.cfg\n"
 	     "  trafgen -e | trafgen -i - -o eth0 --cpp -n 1\n"
+	     "  trafgen --dev eth0 --in trafgen.pcap --rate 100pps --bind-cpus 4,5\n"
 	     "  trafgen --dev eth0 --conf fuzzing.cfg --smoke-test 10.0.0.1\n"
 	     "  trafgen --dev wlan0 --rfraw --conf beacon-test.txf -V --cpus 2\n"
 	     "  trafgen --dev eth0 --conf frag_dos.cfg --rand --gap 1000us\n"
@@ -556,6 +573,16 @@ static bool shaper_is_set(struct shaper *sh)
        return sh->type != SHAPER_NONE;
 }
 
+/*
+ * Function to check if shaper type is set to packets or bytes.
+ * @param shaper *sh: pointer to shaper
+ * @return true when shaper is packets or bytes
+ */
+static bool shaper_is_pkts_or_bytes(struct shaper *sh)
+{
+       return (sh->type == SHAPER_PKTS || sh->type == SHAPER_BYTES);
+}
+
 static void shaper_init(struct shaper *sh)
 {
 	if (sh->type == SHAPER_NONE || sh->type == SHAPER_DELAY)
@@ -831,16 +858,17 @@ static unsigned long __wait_and_sum_others(struct ctx *ctx, unsigned int cpu)
 	unsigned long total;
 
 	for (i = 0, total = plen; i < ctx->cpus; i++) {
-		if (i == cpu)
+		int cpu_id = ctx->bind_cpus[i];
+		if (cpu_id == cpu)
 			continue;
 
-		while ((__get_state(i) &
+		while ((__get_state(cpu_id) &
 		       (CPU_STATS_STATE_CFG |
 			CPU_STATS_STATE_RES)) == 0 &&
 		       sigint == 0)
 			sched_yield();
 
-		total += stats[i].cf_packets;
+		total += stats[cpu_id].cf_packets;
 	}
 
 	return total;
@@ -854,16 +882,17 @@ static void __correct_global_delta(struct ctx *ctx, unsigned int cpu, unsigned l
 	long long delta_correction = 0;
 
 	for (i = 0, total = ctx->num; i < ctx->cpus; i++) {
-		if (i == cpu)
+		int cpu_id = ctx->bind_cpus[i];
+		if (cpu_id == cpu)
 			continue;
 
-		while ((__get_state(i) &
+		while ((__get_state(cpu_id) &
 		       (CPU_STATS_STATE_CHK |
 			CPU_STATS_STATE_RES)) == 0 &&
 		       sigint == 0)
 			sched_yield();
 
-		total += stats[i].cd_packets;
+		total += stats[cpu_id].cd_packets;
 	}
 
 	if (total > orig)
@@ -872,10 +901,11 @@ static void __correct_global_delta(struct ctx *ctx, unsigned int cpu, unsigned l
 		delta_correction = +1 * ((long long) orig - total);
 
 	for (cpu_sel = -1, i = 0; i < ctx->cpus; i++) {
-		if (stats[i].cd_packets > 0) {
-			if ((long long) stats[i].cd_packets +
+		int cpu_id = ctx->bind_cpus[i];
+		if (stats[cpu_id].cd_packets > 0) {
+			if ((long long) stats[cpu_id].cd_packets +
 			    delta_correction >= 0) {
-				cpu_sel = i;
+				cpu_sel = cpu_id;
 				break;
 			}
 		}
@@ -940,7 +970,12 @@ static void main_loop(struct ctx *ctx, char *confname, bool slow,
 	if (ctx->dev_in && dev_io_is_pcap(ctx->dev_in)) {
 		pcap_load_packets(ctx->dev_in);
 		shaper_set_tstamp(&ctx->sh, &packets[0].tstamp);
-		ctx->num = plen;
+		/*
+		 * Set num to 0 to keep sending packets until an interrupt is received.
+		 * If num is set to plen, it will only send packets present in the pcap
+		 * and stops.
+		 */
+		ctx->num = 0;
 	} else {
 		if (ctx->packet_str)
 			compile_packets_str(ctx->packet_str, ctx->verbose, cpu);
@@ -952,13 +987,14 @@ static void main_loop(struct ctx *ctx, char *confname, bool slow,
 
 	xmit_packet_precheck(ctx, cpu);
 
-	if (cpu == 0) {
+	if (cpu == ctx->cpu_min) {
 		unsigned int i;
 		size_t total_len = 0, total_pkts = 0;
 
 		for (i = 0; i < ctx->cpus; ++i) {
-			total_len  += stats[i].cf_bytes;
-			total_pkts += stats[i].cf_packets;
+			int cpu_id = ctx->bind_cpus[i];
+			total_len  += stats[cpu_id].cf_bytes;
+			total_pkts += stats[cpu_id].cf_packets;
 		}
 
 		printf("%6zu packets to schedule\n", total_pkts);
@@ -1023,12 +1059,18 @@ int main(int argc, char **argv)
 
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.cpus = get_number_cpus_online();
+	ctx.cpu_min = 0;
 	ctx.uid = getuid();
 	ctx.gid = getgid();
 	ctx.qdisc_path = false;
 
 	/* Keep an initial small default size to reduce cache-misses. */
 	ctx.reserve_size = 512 * (1 << 10);
+
+	ctx.bind_cpus = malloc(ctx.cpus * sizeof(int));
+	for (int j = 0; j < ctx.cpus; j++) {
+		ctx.bind_cpus[j] = j;
+	}
 
 	while ((c = getopt_long(argc, argv, short_options, long_options,
 				NULL)) != EOF) {
@@ -1059,6 +1101,24 @@ int main(int argc, char **argv)
 			cpus_tmp = strtoul(optarg, NULL, 0);
 			if (cpus_tmp > 0 && cpus_tmp < ctx.cpus)
 				ctx.cpus = cpus_tmp;
+			break;
+		case 'x':
+			ctx.cpu_min = ctx.cpus - 1;
+			char *bind_cpus_tmp = xstrdup(optarg);
+			char *token = strtok(bind_cpus_tmp, ",");
+			int len = 0;
+			while (token != NULL)
+			{
+				int cpu_id = atoi(token);
+				if (cpu_id < 0 || cpu_id >= ctx.cpus)
+					panic("Invalid CPU ID %d provided.\n", cpu_id);
+				if (cpu_id < ctx.cpu_min) {
+					ctx.cpu_min = cpu_id;
+				}
+				ctx.bind_cpus[len++] = cpu_id;
+				token = strtok(NULL, ",");
+			}
+			ctx.cpus = len;
 			break;
 		case 'd':
 		case 'o':
@@ -1213,6 +1273,7 @@ int main(int argc, char **argv)
 			case 'S':
 			case 's':
 			case 'P':
+			case 'x':
 			case 'o':
 			case 'E':
 			case 'i':
@@ -1231,6 +1292,14 @@ int main(int argc, char **argv)
 			break;
 		}
 	}
+
+	/*
+	* TODO: Handle below cases:
+	* 1. For config file input, handle for cpu ids mentioned in the cfg
+	* 2. For pinned Pods, CPU affinity is not possible for all cpus,
+	*    so I can not simply divide by total no of cpus
+	*/
+	ctx.sh.rate = ctx.sh.rate / ctx.cpus;
 
 	if (argc >= optind) {
 		min_opts = 4;
@@ -1282,10 +1351,14 @@ int main(int argc, char **argv)
 	    || !dev_io_is_netdev(ctx.dev_out)) {
 
 		prctl(PR_SET_TIMERSLACK, 1UL);
-		/* Fall back to single core to not mess up correct timing.
-		 * We are slow anyway!
-		 */
-		ctx.cpus = 1;
+
+		// Allow multiple cpus when running trafgen with rate limit
+		if (!shaper_is_pkts_or_bytes(&ctx.sh)) {
+			/* Fall back to single core to not mess up correct timing.
+			 * We are slow anyway!
+			 */
+			ctx.cpus = 1;
+		}
 		slow = true;
 	}
 
@@ -1305,6 +1378,7 @@ int main(int argc, char **argv)
 	stats = setup_shared_var(ctx.cpus);
 
 	for (i = 0; i < ctx.cpus; i++) {
+		int cpu_id = ctx.bind_cpus[i];
 		pid_t pid = fork();
 
 		switch (pid) {
@@ -1313,8 +1387,8 @@ int main(int argc, char **argv)
 				seed = generate_srand_seed();
 			srand(seed);
 
-			cpu_affinity(i);
-			main_loop(&ctx, confname, slow, i, invoke_cpp,
+			cpu_affinity(cpu_id);
+			main_loop(&ctx, confname, slow, cpu_id, invoke_cpp,
 				  cpp_argv, orig_num);
 
 			goto thread_out;
@@ -1335,11 +1409,12 @@ int main(int argc, char **argv)
 		reset_system_socket_memory(vals, array_size(vals));
 
 	for (i = 0, tx_packets = tx_bytes = 0; i < ctx.cpus; i++) {
-		while ((__get_state(i) & CPU_STATS_STATE_RES) == 0)
+		int cpu_id = ctx.bind_cpus[i];
+		while ((__get_state(cpu_id) & CPU_STATS_STATE_RES) == 0)
 			sched_yield();
 
-		tx_packets += stats[i].tx_packets;
-		tx_bytes   += stats[i].tx_bytes;
+		tx_packets += stats[cpu_id].tx_packets;
+		tx_bytes   += stats[cpu_id].tx_bytes;
 	}
 
 	fflush(stdout);
@@ -1347,9 +1422,10 @@ int main(int argc, char **argv)
 	printf("\r%12llu packets outgoing\n", tx_packets);
 	printf("\r%12llu bytes outgoing\n", tx_bytes);
 	for (i = 0; cpustats && i < ctx.cpus; i++) {
+		int cpu_id = ctx.bind_cpus[i];
 		printf("\r%12lu sec, %lu usec on CPU%d (%llu packets)\n",
-		       stats[i].tv_sec, stats[i].tv_usec, i,
-		       stats[i].tx_packets);
+		       stats[cpu_id].tv_sec, stats[cpu_id].tv_usec, cpu_id,
+		       stats[cpu_id].tx_packets);
 	}
 
 thread_out:
