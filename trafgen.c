@@ -1058,7 +1058,9 @@ int main(int argc, char **argv)
 	struct timespec delay;
 
 	memset(&ctx, 0, sizeof(ctx));
-	ctx.cpus = get_number_cpus_online();
+
+	unsigned int cpu_count = get_number_cpus_online();
+	ctx.cpus = cpu_count;
 	ctx.cpu_min = 0;
 	ctx.uid = getuid();
 	ctx.gid = getgid();
@@ -1375,7 +1377,7 @@ int main(int argc, char **argv)
 		device_set_irq_affinity_list(irq, 0, ctx.cpus - 1);
 	}
 
-	stats = setup_shared_var(ctx.cpus);
+	stats = setup_shared_var(cpu_count);
 
 	for (i = 0; i < ctx.cpus; i++) {
 		int cpu_id = ctx.bind_cpus[i];
